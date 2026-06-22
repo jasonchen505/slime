@@ -1,0 +1,10 @@
+{
+  "num_tasks": 8,
+  "num_samples": 8,
+  "pass_rate": 1.0,
+  "total_response_tokens": 16,
+  "avg_response_tokens": 2.0,
+  "wall_time_sec": 11.067,
+  "num_gpus_visible": 8,
+  "num_workers": 8
+}
