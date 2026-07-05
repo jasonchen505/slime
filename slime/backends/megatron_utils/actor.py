@@ -27,7 +27,7 @@ from slime.utils.types import RolloutBatch
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
-from .cp_utils import slice_log_prob_with_cp, slice_with_cp
+from .cp_utils import prepare_routed_experts_for_routing_replay, slice_log_prob_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data
 from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
@@ -142,12 +142,14 @@ class MegatronTrainRayActor(TrainRayActor):
             ), "--update-weight-mode=delta is not supported with --colocate"
             update_weight_cls = UpdateWeightFromTensor
         elif self.args.update_weight_mode == "delta":
-            # Lazy import: the delta module pulls DeltaEncoding/DeltaParam/DeltaSpec from
-            # sglang, which only exist on newer images. Importing eagerly would break old
-            # images even when delta mode is unused.
-            from .update_weight.update_weight_from_distributed_delta import UpdateWeightFromDistributedDelta
+            # Delta sync is disk-transport only: each host applies the published deltas into
+            # its local checkpoint and the engines reload via vanilla update_weights_from_disk.
+            assert (
+                self.args.update_weight_transport == "disk"
+            ), "--update-weight-mode=delta requires --update-weight-transport=disk"
+            from .update_weight.update_weight_from_disk_delta import UpdateWeightFromDiskDelta
 
-            update_weight_cls = UpdateWeightFromDistributedDelta
+            update_weight_cls = UpdateWeightFromDiskDelta
         else:
             assert self.args.update_weight_mode == "full"
             if self.args.update_weight_transport == "disk":
@@ -293,45 +295,16 @@ class MegatronTrainRayActor(TrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-
-        def pad_func(experts, pad):
-            _, num_layers, topk = experts.shape
-            pad = (
-                torch.arange(
-                    pad * num_layers * topk,
-                    device=experts.device,
-                    dtype=experts.dtype,
-                ).reshape((pad, num_layers, topk))
-                % self.args.num_experts
-            )
-            return torch.cat([experts, pad], dim=0)
-
         for _ in range(sum(num_microbatches)):
             batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
-            rollout_routed_experts = batch["rollout_routed_experts"]
-            tokens = batch["tokens"]
-            assert len(rollout_routed_experts) == len(tokens)
-            for a, b in zip(rollout_routed_experts, tokens, strict=False):
-                assert a.shape[0] == b.shape[0] - 1, f"{a.shape}, {b.shape}"
-
-            # We need to pad the experts to the last token. We won't calculate loss on this token so this should be fine.
-            # TODO: fuse this padding with the following slice_with_cp to reduce memory copy.
-            rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
-            # TODO: maybe extract a common process function for here and get_batch?
-            rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-            if pad != 0:
-                rollout_routed_experts = pad_func(rollout_routed_experts, pad)
-
-            if self.args.sequence_parallel:
-                seqlen = rollout_routed_experts.size(0)
-                assert seqlen % tp_size == 0
-                start, end = seqlen // tp_size * tp_rank, seqlen // tp_size * (tp_rank + 1)
-                rollout_routed_experts = rollout_routed_experts[start:end]
+            rollout_routed_experts = prepare_routed_experts_for_routing_replay(
+                batch["rollout_routed_experts"],
+                batch["tokens"],
+                num_experts=self.args.num_experts,
+                data_pad_size_multiplier=self.args.data_pad_size_multiplier,
+                sequence_parallel=self.args.sequence_parallel,
+                allgather_cp=self.args.allgather_cp,
+            )
 
             routing_replay_offset = 0
             for vp_stage, model in enumerate(self.model):
@@ -587,9 +560,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_updatable_engines_and_lock.remote()
-        )
+        (
+            rollout_engines,
+            rollout_engine_lock,
+            num_new_engines,
+            engine_gpu_counts,
+            engine_gpu_offsets,
+            all_engine_actors,
+        ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
@@ -609,6 +587,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_engine_lock,
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
+                all_engine_actors=all_engine_actors,
             )
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
