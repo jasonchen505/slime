@@ -28,11 +28,10 @@ try:
     from megatron.core.pipeline_parallel.utils import unwrap_model
 except ImportError:
     from megatron.core.utils import unwrap_model
-from slime.utils import logging_utils
+from slime.observability import logging_utils, train_metric_utils
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
@@ -270,7 +269,7 @@ def _patch_megatron_adam(adam_cls):
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
+) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
     """Build model(s), wrap with DDP, and construct optimizer and scheduler.
 
     Args:
@@ -283,7 +282,7 @@ def setup_model_and_optimizer(
         lr_mult (float): Global learning-rate multiplier for the optimizer.
 
     Returns:
-        tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
+        tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
             - List of model chunks wrapped by ``DDP``.
             - The constructed ``MegatronOptimizer`` instance.
             - The learning-rate/weight-decay scheduler tied to the optimizer.
@@ -292,6 +291,10 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+
+    if args.num_rollout == 0:
+        args.no_load_optim = True
+        return model, None, None
 
     # Optimizer
     kwargs = {}
@@ -593,6 +596,9 @@ def train_one_step(
                     "rollout_log_probs",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    # Only present when dumping train debug data; lets the loss
+                    # snapshot each sample's log_probs keyed by rollout position.
+                    *(["partition"] if args.save_debug_train_data is not None else []),
                 ],
             ),
             args.data_pad_size_multiplier,
@@ -685,7 +691,7 @@ def train_one_step(
     optimizer.zero_grad()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        loss_reduced = reduce_train_step_metrics(
+        loss_reduced = train_metric_utils.reduce_train_step_metrics(
             losses_reduced,
             calculate_per_token_loss=args.calculate_per_token_loss,
             step_global_batch_size=step_global_batch_size,
@@ -854,15 +860,15 @@ def train(
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-                # here we assume only one mtp layer
-                mtp_losses = (tracker["values"] * mtp_loss_scale).item()
+                # Multi-head MTP: tracker["values"] is [num_mtp_layers]; aggregate below.
+                mtp_losses = tracker["values"] * mtp_loss_scale
                 MTPLossLoggingHelper.clean_loss_in_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:
                     from slime.backends.megatron_utils.ci_utils import check_mtp_loss
 
-                    check_mtp_loss(mtp_losses)
+                    check_mtp_loss(mtp_losses.sum().item())
 
         # per train step log.
         if (
@@ -879,7 +885,9 @@ def train(
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
-                log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+                for _i in range(mtp_losses.shape[0]):
+                    log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
+                log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses.sum().item()
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
@@ -890,7 +898,8 @@ def train(
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
-                assert log_dict["train/train_rollout_logprob_abs_diff"] <= 0.1, f"{log_dict=}"
+                threshold = args.ci_train_rollout_logprob_abs_diff_threshold
+                assert log_dict["train/train_rollout_logprob_abs_diff"] <= threshold, f"{threshold=} {log_dict=}"
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
@@ -967,7 +976,7 @@ def save(
 
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
+) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
     Args:
@@ -975,7 +984,7 @@ def initialize_model_and_optimizer(
         role (str): Logical role of the model (e.g., "actor", "critic").
 
     Returns:
-        tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
+        tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, int]:
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
 
@@ -996,7 +1005,6 @@ def initialize_model_and_optimizer(
         optimizer,
         opt_param_scheduler,
         checkpointing_context={},
-        skip_load_to_model_and_opt=False,
     )
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(args, model)
