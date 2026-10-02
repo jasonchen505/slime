@@ -1,5 +1,7 @@
 import argparse
 import importlib.util
+import runpy
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -7,6 +9,41 @@ from pathlib import Path
 import pytest
 
 NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("mode", ["save", "async_save", "load"])
+@pytest.mark.parametrize("optimizer", ["cpu", "gpu"])
+def test_checkpoint_e2e_launch_has_valid_save_configuration(monkeypatch, tmp_path, mode, optimizer):
+    from slime.utils import external_utils
+
+    commands = []
+    launcher = types.ModuleType("slime.utils.external_utils.command_utils")
+    launcher.execute_train = lambda **kwargs: commands.append(kwargs["train_args"])
+    launcher.get_default_wandb_args = lambda _: ""
+    monkeypatch.setitem(sys.modules, launcher.__name__, launcher)
+    monkeypatch.setattr(external_utils, "command_utils", launcher, raising=False)
+    test = runpy.run_path(str(Path(__file__).with_name("test_qwen3_4B_ckpt.py")))
+    directory = str(tmp_path / "checkpoint with spaces")
+    test["execute"](mode, optimizer=optimizer, checkpoint_dir=directory)
+    [command] = commands
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save")
+    parser.add_argument("--save-interval", type=int)
+    parser.add_argument("--load")
+    parser.add_argument("--ckpt-step", type=int)
+    parser.add_argument("--async-save", action="store_true")
+    args, _ = parser.parse_known_args(shlex.split(command))
+
+    assert args.save == directory
+    # Megatron requires a positive save interval whenever --save is set,
+    # including when straw uses the directory to track a restored branch.
+    assert args.save_interval is not None and args.save_interval > 0
+    assert args.async_save == (mode == "async_save")
+    if mode == "load":
+        assert args.load == directory and args.ckpt_step == 1
+    else:
+        assert args.load is None
 
 
 def load_arguments_module(monkeypatch):
@@ -179,6 +216,14 @@ def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
 
 def make_slime_validate_args(**overrides):
     values = dict(
+        flush_cache_interval=1,
+        rollout_data_transport="object-store",
+        rollout_data_dir=None,
+        rollout_queue_lease_seconds=300,
+        rollout_queue_segment_mib=256,
+        rollout_io_concurrency=4,
+        use_distributed_post=False,
+        data_source_path=None,
         eval_config=None,
         eval_prompt_data=None,
         kl_coef=0,
@@ -238,7 +283,6 @@ def make_slime_validate_args(**overrides):
         over_sampling_batch_size=None,
         num_epoch=None,
         num_rollout=1,
-        rollout_global_dataset=False,
         enable_mtp_training=False,
         mtp_num_layers=None,
         use_rollout_routing_replay=False,
@@ -249,7 +293,6 @@ def make_slime_validate_args(**overrides):
         rollout_max_prompt_len=None,
         train_backend="megatron",
         release_train=False,
-        keep_old_actor=False,
         only_train_params_name_list=None,
         freeze_params_name_list=None,
         update_weight_transport="nccl",
@@ -260,6 +303,133 @@ def make_slime_validate_args(**overrides):
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    "rollout_path",
+    [
+        "slime.rollout.sglang_rollout.generate_rollout",
+        "slime.rollout.fully_async_rollout.generate_rollout_fully_async",
+        "custom.rollout",
+    ],
+)
+def test_pipeline_rl_defaults_to_fully_async_with_separate_eval(monkeypatch, rollout_path):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(flush_cache_interval=0, rollout_function_path=rollout_path)
+    module.slime_validate_args(args)
+    expected = (
+        "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+        if "sglang_rollout" in rollout_path
+        else rollout_path
+    )
+    assert args.rollout_function_path == expected
+    assert args.eval_function_path == "slime.rollout.sglang_rollout.generate_rollout"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"colocate": True}, {"offload_rollout": True}, {"debug_train_only": True}, {"debug_rollout_only": True}],
+)
+def test_pipeline_rl_rejects_incompatible_lifecycles(monkeypatch, options):
+    module = load_slime_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="flush-cache-interval"):
+        module.slime_validate_args(make_slime_validate_args(flush_cache_interval=0, **options))
+
+
+def test_flush_cache_interval_defaults_to_existing_behavior(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    assert parser.parse_args(["--rollout-batch-size", "1"]).flush_cache_interval == 1
+    assert parser.parse_args(["--rollout-batch-size", "1", "--flush-cache-interval", "0"]).flush_cache_interval == 0
+    args = make_slime_validate_args(rollout_function_path="slime.rollout.sglang_rollout.generate_rollout")
+    module.slime_validate_args(args)
+    assert args.rollout_function_path == args.eval_function_path == "slime.rollout.sglang_rollout.generate_rollout"
+
+
+@pytest.mark.parametrize("interval", [-1, -100])
+def test_negative_flush_cache_interval_disables_training_flush(monkeypatch, interval):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        flush_cache_interval=interval, rollout_function_path="slime.rollout.sglang_rollout.generate_rollout"
+    )
+    module.slime_validate_args(args)
+    assert args.rollout_function_path == "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+
+
+def test_distributed_fully_async_is_opt_in(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    assert defaults.rollout_function_path == "slime.rollout.sglang_rollout.generate_rollout"
+    assert defaults.data_source_path is None
+    assert defaults.rollout_data_transport == "object-store"
+    assert defaults.rollout_data_dir is None
+    assert not defaults.rollout_queue_online_gc
+    path = "slime.data.queue_data_source.QueueDataSource"
+    enabled = parser.parse_args(["--rollout-batch-size", "1", "--data-source-path", path])
+    assert enabled.data_source_path == path
+
+
+@pytest.mark.parametrize("transport", ["object-store", "nixl", "straw"])
+def test_rollout_transport_selects_source_and_only_straw_needs_storage(monkeypatch, tmp_path, transport):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    parsed = parser.parse_args(["--rollout-batch-size", "1", "--rollout-data-transport", transport])
+    args = make_slime_validate_args(rollout_data_transport=parsed.rollout_data_transport)
+    if transport == "straw":
+        with pytest.raises(ValueError, match="--rollout-data-dir or --save"):
+            module.slime_validate_args(args)
+        args.save = str(tmp_path)
+    module.slime_validate_args(args)
+    if transport == "straw":
+        assert args.data_source_path == "slime.data.queue_data_source.QueueDataSource"
+        assert args.rollout_data_dir == str(tmp_path / "rollout_data")
+    else:
+        assert args.data_source_path == "slime.data.data_source.RolloutDataSourceWithBuffer"
+        assert args.rollout_data_dir is None
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rollout_queue_online_gc": True},
+        {"data_source_path": "slime.data.queue_data_source.QueueDataSource"},
+    ],
+)
+def test_queue_options_require_straw_transport(monkeypatch, overrides):
+    module = load_slime_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="requires --rollout-data-transport straw"):
+        module.slime_validate_args(make_slime_validate_args(**overrides))
+
+
+def test_global_dataset_flag_is_removed(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1"])
+    assert not hasattr(args, "rollout_global_dataset")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--disable-rollout-global-dataset"])
+    # Epoch-based scheduling no longer depends on this attribute.
+    module.slime_validate_args(make_slime_validate_args(num_epoch=2, num_rollout=None))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--rollout-queue-resume",
+        "--rollout-queue-fork",
+        "--rollout-queue-max-pending",
+        "--rollout-queue-max-inflight",
+    ],
+)
+def test_removed_queue_flags_are_rejected(monkeypatch, flag):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    assert not hasattr(defaults, flag[2:].replace("-", "_"))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", flag])
 
 
 @pytest.mark.unit

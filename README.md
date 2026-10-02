@@ -51,7 +51,7 @@ Choosing SGLang as the single rollout backend is also intentional. Multi-backend
 
 ## Correctness, Stability, and CI
 
-slime is developed as RL infrastructure, where "the script runs" is not enough. The project maintains CPU unit tests, contract tests for customization hooks, and GPU end-to-end tests covering dense and MoE models, Megatron training paths, SGLang deployment configurations, checkpointing, numerical precision, async rollout, OPD, PPO-style workflows, and debug rollout-then-train replay.
+slime is developed as RL infrastructure, where "the script runs" is not enough. The project maintains CPU unit tests, contract tests for customization hooks, and GPU end-to-end tests covering dense and MoE models, Megatron training paths, SGLang deployment configurations, checkpointing, numerical precision, fully-async rollout, OPD, PPO-style workflows, and debug rollout-then-train replay.
 
 Useful engineering docs:
 
@@ -90,6 +90,8 @@ Useful engineering docs:
 - **training (Megatron)**: Responsible for the main training process, reads data from the Data Buffer, and synchronizes parameters to the rollout module after training.
 - **rollout (SGLang + router)**: Generates new data (including rewards/verifier outputs) and stores it in the Data Buffer. Custom generate functions can wrap this with multi-turn loops, tool calls, environment/sandbox interaction, and verifier-based reward.
 - **data buffer**: A bridge module that manages prompt initialization, custom data, and rollout generation methods (including agentic workflows that produce samples through the same interface).
+
+The default payload transport is Ray `object-store`. Selecting `--rollout-data-transport straw` uses [straw](https://github.com/zhuzilin/straw) for persistent prompt tasks, rollout continuations and training batches on shared JuiceFS storage. Ray carries control messages and references; generation and training processes read and write packed payloads directly. See the [straw usage and recovery guide](docs/en/advanced/straw.md).
 
 ## Quick Start
 
@@ -131,7 +133,7 @@ These are not just demos. They are independent systems that use slime as a reusa
 
 ### 🦞 OpenClaw-RL: Train a Personalized Clawbot Simply by Talking to It
 
-[**OpenClaw-RL**](https://github.com/Gen-Verse/OpenClaw-RL) is an RL server for personalized OpenClaw agents. It hosts the OpenClaw model and improves it from prior conversations across deployments, while slime's asynchronous RL infrastructure prevents training from interfering with API serving. It supports two automatic optimization methods: GRPO with binary feedback inferred from subsequent states, and on-policy distillation that extracts hindsight hints from later feedback for the current policy.
+[**OpenClaw-RL**](https://github.com/Gen-Verse/OpenClaw-RL) is an RL server for personalized OpenClaw agents. It hosts the OpenClaw model and improves it from prior conversations across deployments, while slime's decoupled RL infrastructure prevents training from interfering with API serving. It supports two automatic optimization methods: GRPO with binary feedback inferred from subsequent states, and on-policy distillation that extracts hindsight hints from later feedback for the current policy.
 
 ### ⚛️ P1: Mastering Physics Olympiads with Reinforcement Learning
 

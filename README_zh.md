@@ -51,7 +51,7 @@ slime 不只是一个能调用推理后端的框架。它尽量保留 Megatron �
 
 ## 正确性、稳定性与 CI
 
-slime 被当作 RL 基础设施来开发，因为“脚本能跑起来”远远不够。项目维护 CPU unit test、customization hook contract test，以及 GPU end-to-end test，覆盖 dense 和 MoE 模型、Megatron training path、SGLang deployment config、checkpoint、数值精度、async rollout、OPD、PPO-style workflow，以及 debug rollout-then-train replay。
+slime 被当作 RL 基础设施来开发，因为“脚本能跑起来”远远不够。项目维护 CPU unit test、customization hook contract test，以及 GPU end-to-end test，覆盖 dense 和 MoE 模型、Megatron training path、SGLang deployment config、checkpoint、数值精度、fully-async rollout、OPD、PPO-style workflow，以及 debug rollout-then-train replay。
 
 相关工程文档：
 
@@ -91,6 +91,8 @@ slime 被当作 RL 基础设施来开发，因为“脚本能跑起来”远远�
 - **training (Megatron)**：负责主训练流程，从 Data Buffer 读取数据，训练完后将参数同步至 rollout 模块；
 - **rollout (SGLang + router)**：生成新数据（含 reward/verifier），存储至 Data Buffer；通过 custom generate 可以在其上叠加 multi-turn loop、tool call、environment/sandbox 交互以及 verifier-based reward；
 - **data buffer**：桥梁模块，管理 prompt 初始化、自定义数据与 rollout 生成方法（包括以同一套接口产出 sample 的 agentic workflow）。
+
+默认载荷传输为 Ray `object-store`。选择 `--rollout-data-transport straw` 后，通过 [straw](https://github.com/zhuzilin/straw) 在 JuiceFS 共享存储上持久化 prompt 任务、rollout continuation 和训练 batch。Ray 传递控制消息与引用，生成和训练进程直接并行读写打包载荷。详见 [straw 使用与恢复指南](docs/zh/advanced/straw.md)。
 
 ## 快速开始
 
@@ -133,7 +135,7 @@ slime 被当作 RL 基础设施来开发，因为“脚本能跑起来”远远�
 
 ### 🦞 OpenClaw-RL: Train a Personalized Clawbot Simply by Talking to It
 
-[**OpenClaw-RL**](https://github.com/Gen-Verse/OpenClaw-RL) 是面向 personalized OpenClaw agent 的 RL server。它托管 OpenClaw model，并从跨部署的历史对话中持续改进模型，同时 slime 的 asynchronous RL infrastructure 避免训练过程干扰 API serving。它支持两种自动优化方法：基于后续状态推断 binary feedback 的 GRPO，以及从后续反馈中提取 hindsight hint 的 on-policy distillation。
+[**OpenClaw-RL**](https://github.com/Gen-Verse/OpenClaw-RL) 是面向 personalized OpenClaw agent 的 RL server。它托管 OpenClaw model，并从跨部署的历史对话中持续改进模型，同时 slime 的 decoupled RL infrastructure 避免训练过程干扰 API serving。它支持两种自动优化方法：基于后续状态推断 binary feedback 的 GRPO，以及从后续反馈中提取 hindsight hint 的 on-policy distillation。
 
 ### ⚛️ P1: Mastering Physics Olympiads with Reinforcement Learning
 
