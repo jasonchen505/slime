@@ -1,13 +1,227 @@
 import asyncio
 import json
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
+import requests
 
 from slime.backends.sglang_utils import server_control
 from slime.utils import http_utils
 
 NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+def test_colocated_engine_retirement_waits_for_gpu_release(monkeypatch, shutdown_fails):
+    from slime.backends.sglang_utils import engine_group
+
+    engine = SimpleNamespace(shutdown=SimpleNamespace(remote=lambda: "shutdown"))
+    group = engine_group.ServerGroup(
+        args=SimpleNamespace(num_gpus_per_node=1),
+        pg=None,
+        all_engines=[engine],
+        num_gpus_per_engine=1,
+        num_new_engines=0,
+        worker_type="encoder",
+        needs_offload=True,
+    )
+    events = []
+
+    def get(refs, *, timeout):
+        assert refs == ["shutdown"] and timeout == 0.1
+        events.append("wait for shutdown")
+        if shutdown_fails:
+            raise TimeoutError("server still holds GPUs")
+
+    monkeypatch.setattr(engine_group.ray, "get", get)
+    monkeypatch.setattr(engine_group.ray, "kill", lambda actor, **kw: events.append("kill actor"))
+    if shutdown_fails:
+        with pytest.raises(TimeoutError, match="server still holds GPUs"):
+            group.retire_engine(0, timeout=0.1)
+        assert group.all_engines == [engine]
+    else:
+        group.retire_engine(0, timeout=0.1)
+        assert group.all_engines == [None]
+    assert events == ["wait for shutdown", "kill actor"]
+
+
+@pytest.mark.parametrize("failure", ["connection", "timeout", "status"])
+def test_rollout_boundary_prunes_failed_router_workers(monkeypatch, failure):
+    calls = []
+
+    async def respond(request):
+        calls.append((request.method, str(request.url)))
+        if request.url.path == "/workers":
+            return httpx.Response(
+                200, json={"workers": [{"id": "good", "url": "http://good"}, {"id": "bad", "url": "http://bad"}]}
+            )
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        if request.url.host == "bad":
+            if failure == "connection":
+                raise httpx.ConnectError("server stopped", request=request)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("server stuck", request=request)
+            return httpx.Response(503)
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(server_control.httpx, "AsyncClient", lambda **kwargs: client)
+    workers = asyncio.run(server_control.get_live_router_workers("http://router", timeout=0.1))
+    assert workers == [{"id": "good", "url": "http://good"}]
+    assert ("DELETE", "http://router/workers/bad") in calls
+    assert ("DELETE", "http://router/workers/good") not in calls
+
+
+def _router_response(status_code, payload):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = json.dumps(payload).encode()
+    response.url = "http://router/workers"
+    return response
+
+
+def _fake_router(monkeypatch, *, post_status, post_body, workers):
+    calls = []
+
+    def fake_post(url, json):
+        calls.append(("POST", url, json))
+        return _router_response(post_status, post_body)
+
+    def fake_get(url, timeout):
+        calls.append(("GET", url))
+        return _router_response(200, {"workers": workers})
+
+    monkeypatch.setattr(server_control.requests, "post", fake_post)
+    monkeypatch.setattr(server_control.requests, "get", fake_get)
+    return calls
+
+
+EXISTS = {"error": "Worker already exists at URL 'http://e:1'", "code": "WORKER_ALREADY_EXISTS"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", [200, 202])
+def test_register_worker_posts_the_payload(monkeypatch, status):
+    calls = _fake_router(monkeypatch, post_status=status, post_body={"worker_id": "w1"}, workers=[])
+
+    server_control.register_worker("http://router", {"url": "http://e:1", "worker_type": "regular"})
+
+    assert calls == [("POST", "http://router/workers", {"url": "http://e:1", "worker_type": "regular"})]
+
+
+@pytest.mark.unit
+def test_register_worker_keeps_the_registration_an_earlier_run_left(monkeypatch):
+    # A router whose POST /workers is create-only (409 WORKER_ALREADY_EXISTS)
+    # still holds an external engine registered by the previous run.
+    payload = {"url": "http://e:1", "worker_type": "prefill", "bootstrap_port": 8998}
+    calls = _fake_router(
+        monkeypatch,
+        post_status=409,
+        post_body=EXISTS,
+        workers=[{"id": "w1", "url": "http://e:1", "worker_type": "prefill", "bootstrap_port": 8998, "priority": 50}],
+    )
+
+    server_control.register_worker("http://router", payload)
+
+    assert [call[0] for call in calls] == ["POST", "GET"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {"id": "w1", "url": "http://e:1", "worker_type": "decode"},
+        {"id": "w1", "url": "http://e:1", "worker_type": "prefill", "bootstrap_port": 9000},
+        {"id": "w1", "url": "http://e:1", "worker_type": "prefill"},
+    ],
+)
+def test_register_worker_refuses_a_registration_that_differs(monkeypatch, existing):
+    _fake_router(monkeypatch, post_status=409, post_body=EXISTS, workers=[existing])
+
+    with pytest.raises(requests.HTTPError):
+        server_control.register_worker(
+            "http://router", {"url": "http://e:1", "worker_type": "prefill", "bootstrap_port": 8998}
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "status, body",
+    [(409, {"error": "in progress", "code": "WORKER_CREATE_IN_PROGRESS"}), (409, {}), (500, EXISTS)],
+)
+def test_register_worker_raises_any_other_refusal(monkeypatch, status, body):
+    _fake_router(
+        monkeypatch,
+        post_status=status,
+        post_body=body,
+        workers=[{"id": "w1", "url": "http://e:1", "worker_type": "regular"}],
+    )
+
+    with pytest.raises(requests.HTTPError):
+        server_control.register_worker("http://router", {"url": "http://e:1", "worker_type": "regular"})
+
+
+@pytest.mark.parametrize("actor_failure", ["dead", "wedged"])
+def test_boundary_health_check_bypasses_grace_and_cleans_dead_actor(monkeypatch, actor_failure):
+    from slime.backends.sglang_utils import engine_group
+    from slime.ray.serving import ServingCluster
+    from slime.utils import health_monitor
+
+    calls = []
+    dead = SimpleNamespace(
+        health_generate=SimpleNamespace(remote=lambda **kw: "dead"),
+        shutdown=SimpleNamespace(remote=lambda: "shutdown"),
+    )
+    alive = SimpleNamespace(health_generate=SimpleNamespace(remote=lambda **kw: "alive"))
+    group = engine_group.ServerGroup(
+        args=SimpleNamespace(num_gpus_per_node=1),
+        pg=None,
+        num_gpus_per_engine=1,
+        num_new_engines=0,
+        all_engines=[dead, alive],
+        worker_type="regular",
+        engine_urls={0: "http://dead", 1: "http://alive"},
+        router_ip="router",
+        router_port=8000,
+    )
+    args = SimpleNamespace(
+        rollout_health_check_interval=600, rollout_health_check_first_wait=600, rollout_health_check_timeout=0.1
+    )
+    monitor = health_monitor.RolloutHealthMonitor(group, args)
+    serving = object.__new__(ServingCluster.__ray_metadata__.modified_class)
+    serving.args = args
+    serving._health_monitors = [monitor]
+    serving.servers = {"model": group}
+
+    def wait(refs, *, num_returns, timeout):
+        assert timeout == 0.1
+        if refs == ["shutdown"]:
+            return [], refs
+        assert refs == ["dead", "alive"] and num_returns == 2
+        return (["alive"], ["dead"]) if actor_failure == "wedged" else (refs, [])
+
+    def get(ref, *, timeout):
+        if ref in {"dead", "shutdown"}:
+            raise TimeoutError(actor_failure)
+        return True
+
+    def unregister(router_url, worker_url, *, timeout):
+        calls.append(("unregister", router_url, worker_url))
+
+    monkeypatch.setattr(health_monitor.ray, "wait", wait)
+    monkeypatch.setattr(health_monitor.ray, "get", get)
+    monkeypatch.setattr(health_monitor.ray, "kill", lambda engine, **kw: calls.append(("kill", engine)))
+    monkeypatch.setattr(engine_group, "unregister_worker", unregister)
+    monitor.start()
+    try:
+        snapshot = serving.finish_rollout()
+        assert calls == [("unregister", "http://router:8000", "http://dead"), ("kill", dead)]
+        assert snapshot["model"].all_engines == [None, alive]
+    finally:
+        monitor.stop()
 
 
 @pytest.mark.unit
